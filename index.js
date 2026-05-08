@@ -99,7 +99,6 @@ fastify.register(async (fastify) => {
         let sessionUpdateSent = false;
         let greetingSent = false;
         let responseActive = false;
-        let hasReceivedMedia = false;
         const pendingAudio = [];
 
         const sendSessionUpdate = () => {
@@ -225,9 +224,7 @@ fastify.register(async (fastify) => {
                         openAiWs.send(JSON.stringify(pendingAudio.shift()));
                     }
 
-                    if (!hasReceivedMedia) {
-                        sendInitialGreeting();
-                    }
+                    sendInitialGreeting();
                 }
 
                 if ((response.type === 'response.output_audio.delta' || response.type === 'response.audio.delta') && response.delta) {
@@ -255,8 +252,6 @@ fastify.register(async (fastify) => {
 
                 switch (data.event) {
                     case 'media':
-                        hasReceivedMedia = true;
-
                         const audioAppend = {
                             type: 'input_audio_buffer.append',
                             audio: data.media.payload
