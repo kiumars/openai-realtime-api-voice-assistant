@@ -110,7 +110,6 @@ fastify.register(async (fastify) => {
                     type: 'realtime',
                     instructions: SYSTEM_MESSAGE,
                     output_modalities: ["audio"],
-                    temperature: 0.8,
                     audio: {
                         input: {
                             format: { type: 'audio/pcmu' },
