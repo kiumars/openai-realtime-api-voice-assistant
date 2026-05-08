@@ -96,10 +96,14 @@ fastify.register(async (fastify) => {
         });
 
         let sessionReady = false;
+        let sessionUpdateSent = false;
         let greetingSent = false;
         const pendingAudio = [];
 
         const sendSessionUpdate = () => {
+            if (sessionUpdateSent || openAiWs.readyState !== WebSocket.OPEN) return;
+
+            sessionUpdateSent = true;
             const sessionUpdate = {
                 type: 'session.update',
                 session: {
@@ -147,7 +151,6 @@ fastify.register(async (fastify) => {
         // Open event for OpenAI WebSocket
         openAiWs.on('open', () => {
             console.log('Connected to the OpenAI Realtime API');
-            sendSessionUpdate();
         });
 
         // Listen for messages from the OpenAI WebSocket
@@ -161,6 +164,10 @@ fastify.register(async (fastify) => {
 
                 if (response.type === 'error') {
                     console.error('Realtime API error:', JSON.stringify(response.error, null, 2));
+                }
+
+                if (response.type === 'session.created') {
+                    sendSessionUpdate();
                 }
 
                 // User message transcription handling
