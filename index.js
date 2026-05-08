@@ -33,6 +33,7 @@ fastify.register(fastifyWs);
 
 // Constants
 const SYSTEM_MESSAGE = 'You are an AI receptionist for Barts Automotive. Your job is to politely engage with the client and obtain their name, availability, and service/work required. Ask one question at a time. Do not ask for other contact information, and do not check availability, assume we are free. Ensure the conversation remains friendly and professional, and guide the user to provide these details naturally. If necessary, ask follow-up questions to gather the required information.';
+const INITIAL_GREETING = 'Greet the caller as Bart\'s Automotive and ask how you can help today. Keep it brief.';
 const VOICE = 'alloy';
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
 const PORT = process.env.PORT || 5050;
@@ -51,6 +52,9 @@ const LOG_EVENT_TYPES = [
     'input_audio_buffer.speech_started',
     'session.created',
     'session.updated',
+    'error',
+    'response.created',
+    'response.done',
     'response.text.done',
     'conversation.item.input_audio_transcription.completed',
     'response.output_audio_transcript.done'
@@ -92,6 +96,7 @@ fastify.register(async (fastify) => {
         });
 
         let sessionReady = false;
+        let greetingSent = false;
         const pendingAudio = [];
 
         const sendSessionUpdate = () => {
@@ -126,6 +131,19 @@ fastify.register(async (fastify) => {
             openAiWs.send(JSON.stringify(sessionUpdate));
         };
 
+        const sendInitialGreeting = () => {
+            if (greetingSent || openAiWs.readyState !== WebSocket.OPEN) return;
+
+            greetingSent = true;
+            openAiWs.send(JSON.stringify({
+                type: 'response.create',
+                response: {
+                    output_modalities: ['audio'],
+                    instructions: INITIAL_GREETING
+                }
+            }));
+        };
+
         // Open event for OpenAI WebSocket
         openAiWs.on('open', () => {
             console.log('Connected to the OpenAI Realtime API');
@@ -139,6 +157,10 @@ fastify.register(async (fastify) => {
 
                 if (LOG_EVENT_TYPES.includes(response.type)) {
                     console.log(`Received event: ${response.type}`, response);
+                }
+
+                if (response.type === 'error') {
+                    console.error('Realtime API error:', JSON.stringify(response.error, null, 2));
                 }
 
                 // User message transcription handling
@@ -165,6 +187,8 @@ fastify.register(async (fastify) => {
                     while (pendingAudio.length > 0 && openAiWs.readyState === WebSocket.OPEN) {
                         openAiWs.send(JSON.stringify(pendingAudio.shift()));
                     }
+
+                    sendInitialGreeting();
                 }
 
                 if ((response.type === 'response.output_audio.delta' || response.type === 'response.audio.delta') && response.delta) {
