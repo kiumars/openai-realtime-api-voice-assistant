@@ -98,6 +98,8 @@ fastify.register(async (fastify) => {
         let sessionReady = false;
         let sessionUpdateSent = false;
         let greetingSent = false;
+        let responseActive = false;
+        let hasReceivedMedia = false;
         const pendingAudio = [];
 
         const sendSessionUpdate = () => {
@@ -147,6 +149,23 @@ fastify.register(async (fastify) => {
             }));
         };
 
+        const clearTwilioAudio = () => {
+            if (!session.streamSid) return;
+
+            connection.send(JSON.stringify({
+                event: 'clear',
+                streamSid: session.streamSid
+            }));
+        };
+
+        const cancelActiveResponse = () => {
+            if (!responseActive || openAiWs.readyState !== WebSocket.OPEN) return;
+
+            openAiWs.send(JSON.stringify({ type: 'response.cancel' }));
+            responseActive = false;
+            clearTwilioAudio();
+        };
+
         // Open event for OpenAI WebSocket
         openAiWs.on('open', () => {
             console.log('Connected to the OpenAI Realtime API');
@@ -167,6 +186,18 @@ fastify.register(async (fastify) => {
 
                 if (response.type === 'session.created') {
                     sendSessionUpdate();
+                }
+
+                if (response.type === 'response.created') {
+                    responseActive = true;
+                }
+
+                if (response.type === 'response.done') {
+                    responseActive = false;
+                }
+
+                if (response.type === 'input_audio_buffer.speech_started') {
+                    cancelActiveResponse();
                 }
 
                 // User message transcription handling
@@ -194,7 +225,9 @@ fastify.register(async (fastify) => {
                         openAiWs.send(JSON.stringify(pendingAudio.shift()));
                     }
 
-                    sendInitialGreeting();
+                    if (!hasReceivedMedia) {
+                        sendInitialGreeting();
+                    }
                 }
 
                 if ((response.type === 'response.output_audio.delta' || response.type === 'response.audio.delta') && response.delta) {
@@ -222,6 +255,8 @@ fastify.register(async (fastify) => {
 
                 switch (data.event) {
                     case 'media':
+                        hasReceivedMedia = true;
+
                         const audioAppend = {
                             type: 'input_audio_buffer.append',
                             audio: data.media.payload
