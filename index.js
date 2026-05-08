@@ -7,15 +7,24 @@ import fastifyWs from '@fastify/websocket';
 import fetch from 'node-fetch';
 
 // Load environment variables from .env file
-dotenv.config();
+const dotenvResult = dotenv.config({ override: true });
 
 // Retrieve the OpenAI API key from environment variables
-const { OPENAI_API_KEY } = process.env;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim();
 
 if (!OPENAI_API_KEY) {
     console.error('Missing OpenAI API key. Please set it in the .env file.');
     process.exit(1);
 }
+
+if (!OPENAI_API_KEY.startsWith('sk-') || OPENAI_API_KEY.length < 40) {
+    console.error('Invalid-looking OpenAI API key. Set OPENAI_API_KEY to a real key from https://platform.openai.com/api-keys.');
+    process.exit(1);
+}
+
+console.log(`Loaded OpenAI API key ${OPENAI_API_KEY.slice(0, 7)}...${OPENAI_API_KEY.slice(-4)} (${OPENAI_API_KEY.length} chars)`);
+console.log(`OpenAI API key source: ${dotenvResult.parsed?.OPENAI_API_KEY ? '.env file' : 'process environment'}`);
+console.log(`Working directory: ${process.cwd()}`);
 
 // Initialize Fastify
 const fastify = Fastify();
@@ -25,6 +34,7 @@ fastify.register(fastifyWs);
 // Constants
 const SYSTEM_MESSAGE = 'You are an AI receptionist for Barts Automotive. Your job is to politely engage with the client and obtain their name, availability, and service/work required. Ask one question at a time. Do not ask for other contact information, and do not check availability, assume we are free. Ensure the conversation remains friendly and professional, and guide the user to provide these details naturally. If necessary, ask follow-up questions to gather the required information.';
 const VOICE = 'alloy';
+const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
 const PORT = process.env.PORT || 5050;
 const WEBHOOK_URL = "<input your webhook URL here>";
 
@@ -40,8 +50,10 @@ const LOG_EVENT_TYPES = [
     'input_audio_buffer.speech_stopped',
     'input_audio_buffer.speech_started',
     'session.created',
+    'session.updated',
     'response.text.done',
-    'conversation.item.input_audio_transcription.completed'
+    'conversation.item.input_audio_transcription.completed',
+    'response.output_audio_transcript.done'
 ];
 
 // Root Route
@@ -73,26 +85,39 @@ fastify.register(async (fastify) => {
         let session = sessions.get(sessionId) || { transcript: '', streamSid: null };
         sessions.set(sessionId, session);
 
-        const openAiWs = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01', {
+        const openAiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`, {
             headers: {
-                Authorization: `Bearer ${OPENAI_API_KEY}`,
-                "OpenAI-Beta": "realtime=v1"
+                Authorization: `Bearer ${OPENAI_API_KEY}`
             }
         });
+
+        let sessionReady = false;
+        const pendingAudio = [];
 
         const sendSessionUpdate = () => {
             const sessionUpdate = {
                 type: 'session.update',
                 session: {
-                    turn_detection: { type: 'server_vad' },
-                    input_audio_format: 'g711_ulaw',
-                    output_audio_format: 'g711_ulaw',
-                    voice: VOICE,
+                    type: 'realtime',
                     instructions: SYSTEM_MESSAGE,
-                    modalities: ["text", "audio"],
+                    output_modalities: ["audio"],
                     temperature: 0.8,
-                    input_audio_transcription: {
-                        "model": "whisper-1"
+                    audio: {
+                        input: {
+                            format: { type: 'audio/pcmu' },
+                            turn_detection: {
+                                type: 'server_vad',
+                                create_response: true,
+                                interrupt_response: true
+                            },
+                            transcription: {
+                                model: 'whisper-1'
+                            }
+                        },
+                        output: {
+                            format: { type: 'audio/pcmu' },
+                            voice: VOICE
+                        }
                     }
                 }
             };
@@ -104,7 +129,7 @@ fastify.register(async (fastify) => {
         // Open event for OpenAI WebSocket
         openAiWs.on('open', () => {
             console.log('Connected to the OpenAI Realtime API');
-            setTimeout(sendSessionUpdate, 250);
+            sendSessionUpdate();
         });
 
         // Listen for messages from the OpenAI WebSocket
@@ -125,22 +150,35 @@ fastify.register(async (fastify) => {
 
                 // Agent message handling
                 if (response.type === 'response.done') {
-                    const agentMessage = response.response.output[0]?.content?.find(content => content.transcript)?.transcript || 'Agent message not found';
-                    session.transcript += `Agent: ${agentMessage}\n`;
-                    console.log(`Agent (${sessionId}): ${agentMessage}`);
+                    const agentMessage = response.response.output[0]?.content?.find(content => content.transcript)?.transcript;
+
+                    if (agentMessage && !session.transcript.endsWith(`Agent: ${agentMessage}\n`)) {
+                        session.transcript += `Agent: ${agentMessage}\n`;
+                        console.log(`Agent (${sessionId}): ${agentMessage}`);
+                    }
                 }
 
                 if (response.type === 'session.updated') {
-                    console.log('Session updated successfully:', response);
+                    sessionReady = true;
+                    console.log('Session updated successfully');
+
+                    while (pendingAudio.length > 0 && openAiWs.readyState === WebSocket.OPEN) {
+                        openAiWs.send(JSON.stringify(pendingAudio.shift()));
+                    }
                 }
 
-                if (response.type === 'response.audio.delta' && response.delta) {
+                if ((response.type === 'response.output_audio.delta' || response.type === 'response.audio.delta') && response.delta) {
                     const audioDelta = {
                         event: 'media',
                         streamSid: session.streamSid,
-                        media: { payload: Buffer.from(response.delta, 'base64').toString('base64') }
+                        media: { payload: response.delta }
                     };
                     connection.send(JSON.stringify(audioDelta));
+                }
+
+                if (response.type === 'response.output_audio_transcript.done' && response.transcript) {
+                    session.transcript += `Agent: ${response.transcript}\n`;
+                    console.log(`Agent (${sessionId}): ${response.transcript}`);
                 }
             } catch (error) {
                 console.error('Error processing OpenAI message:', error, 'Raw message:', data);
@@ -154,13 +192,15 @@ fastify.register(async (fastify) => {
 
                 switch (data.event) {
                     case 'media':
-                        if (openAiWs.readyState === WebSocket.OPEN) {
-                            const audioAppend = {
-                                type: 'input_audio_buffer.append',
-                                audio: data.media.payload
-                            };
+                        const audioAppend = {
+                            type: 'input_audio_buffer.append',
+                            audio: data.media.payload
+                        };
 
+                        if (openAiWs.readyState === WebSocket.OPEN && sessionReady) {
                             openAiWs.send(JSON.stringify(audioAppend));
+                        } else if (openAiWs.readyState === WebSocket.CONNECTING || openAiWs.readyState === WebSocket.OPEN) {
+                            pendingAudio.push(audioAppend);
                         }
                         break;
                     case 'start':
@@ -190,8 +230,8 @@ fastify.register(async (fastify) => {
         });
 
         // Handle WebSocket close and errors
-        openAiWs.on('close', () => {
-            console.log('Disconnected from the OpenAI Realtime API');
+        openAiWs.on('close', (code, reason) => {
+            console.log(`Disconnected from the OpenAI Realtime API (code ${code}${reason ? `, reason: ${reason}` : ''})`);
         });
 
         openAiWs.on('error', (error) => {
@@ -278,6 +318,12 @@ async function sendToWebhook(payload) {
 // Main function to extract and send customer details
 async function processTranscriptAndSend(transcript, sessionId = null) {
     console.log(`Starting transcript processing for session ${sessionId}...`);
+
+    if (!transcript.trim()) {
+        console.log('Transcript is empty; skipping customer detail extraction.');
+        return;
+    }
+
     try {
         // Make the ChatGPT completion call
         const result = await makeChatGPTCompletion(transcript);
